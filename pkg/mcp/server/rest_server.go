@@ -967,9 +967,9 @@ func (t *RestMCPTool) Call(httpCtx HttpContext, server Server) error {
 
 			headerMap := convertHeaders(responseHeaders)
 			contentType := headerMap[strings.ToLower("Content-Type")]
-			// 判断是否为图片
+			// Check if the response is an image
 			if strings.HasPrefix(contentType, "image/") {
-				// 处理图片的逻辑
+				// Handle image response by sending it as an MCP tool result
 				utils.SendMCPToolImageResult(ctx, responseBody, contentType, fmt.Sprintf("mcp:tools/call:%s/%s:result", t.serverName, t.name))
 				return
 			}

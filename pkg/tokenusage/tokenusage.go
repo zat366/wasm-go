@@ -59,6 +59,9 @@ const (
 	UsageInputTokensDetailsPathDoubao                = "usage.input_tokens_details"
 	UsageInputTokensDetailsPathGemini                = "usageMetadata.promptTokensDetails"
 
+	UsageCachedInputTokensPathOpenAIChatCompletions = "usage.prompt_tokens_details.cached_tokens"
+	UsageCachedInputTokensPathOpenAIResponses       = "response.usage.input_tokens_details.cached_tokens"
+
 	UsageOutputTokensPathOpenAIChatCompletions = "usage.completion_tokens"
 	UsageOutputTokensPathOpenAIImages          = "usage.output_tokens"
 	UsageOutputTokensPathOpenAIResponses       = "response.usage.output_tokens"
@@ -81,6 +84,7 @@ const (
 
 	InputTokenDetailsKeyAnthropicMessagesUsageCacheCreationInputTokens = "cache_creation_input_tokens"
 	InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens     = "cache_read_input_tokens"
+	InputTokenDetailsKeyCachedTokens                                   = "cached_tokens"
 	InputTokenDetailsKeyGeminiCachedContentTokenCount                  = "cached_content_token_count"
 	InputTokenDetailsKeyGeminiToolUsePromptTokenCount                  = "tool_use_prompt_token_count"
 
@@ -98,6 +102,7 @@ type TokenUsage struct {
 	OutputToken        int64
 	TotalToken         int64
 	Model              string
+	CachedInputToken   int64
 
 	// Anthropic Messages
 	AnthropicCacheCreationInputToken int64
@@ -180,6 +185,16 @@ func ExtractInputTokens(ctx wrapper.HttpContext, body []byte, u *TokenUsage) {
 		UsageInputTokensPathAnthropicMessages,     // Anthrophic messages
 	}); inputToken != nil {
 		u.InputToken = inputToken.Int()
+		if cachedInputToken := wrapper.GetValueFromBody(body, []string{
+			UsageCachedInputTokensPathOpenAIChatCompletions,
+			UsageCachedInputTokensPathOpenAIResponses,
+		}); cachedInputToken != nil {
+			u.CachedInputToken = cachedInputToken.Int()
+			u.InputToken -= u.CachedInputToken
+			if u.InputToken < 0 {
+				u.InputToken = 0
+			}
+		}
 	} else {
 		inputToken, ok := ctx.GetUserAttribute(CtxKeyInputToken).(int64) // anthropic messages
 		if ok && inputToken > 0 {
@@ -281,7 +296,7 @@ func ExtractTotalTokens(ctx wrapper.HttpContext, body []byte, u *TokenUsage) {
 	}); totalToken != nil {
 		u.TotalToken = totalToken.Int()
 	} else {
-		u.TotalToken = u.InputToken + u.OutputToken + u.AnthropicCacheCreationInputToken + u.AnthropicCacheReadInputToken
+		u.TotalToken = u.InputToken + u.OutputToken + u.CachedInputToken + u.AnthropicCacheCreationInputToken + u.AnthropicCacheReadInputToken
 	}
 	ctx.SetUserAttribute(CtxKeyTotalToken, u.TotalToken)
 }

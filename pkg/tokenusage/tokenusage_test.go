@@ -217,6 +217,67 @@ func TestGetTokenUsageOpenAIWithoutProviderTotalKeepsCachedTokensInTotal(t *test
 	assertInt64(t, "total token", 125, usage.TotalToken)
 }
 
+func TestGetTokenUsageOpenAIResponsesCacheWriteFoldsIntoCacheCreationBucket(t *testing.T) {
+	ctx := newTestHttpContext()
+	// GPT-5.6 responses sample: cache_write_tokens is parallel to input_token
+	// and billed separately; it must fold into the cache-creation bucket without
+	// being subtracted from input_token.
+	body := []byte(`{
+		"response": {
+			"id": "resp_test",
+			"model": "gpt-5.6-sol",
+			"usage": {
+				"input_tokens": 71092,
+				"output_tokens": 1641,
+				"total_tokens": 72733,
+				"input_tokens_details": {
+					"cached_tokens": 59136,
+					"cache_write_tokens": 5000
+				}
+			}
+		}
+	}`)
+
+	usage := GetTokenUsage(ctx, body)
+
+	// input_token = 71092 - cached(59136) = 11956, cache_write is NOT subtracted.
+	assertInt64(t, "input token", 11956, usage.InputToken)
+	assertInt64(t, "cached input token", 59136, usage.CachedInputToken)
+	// cache_write folded into the cache-creation bucket used by ai-quota billing / ai-statistics metrics.
+	assertInt64(t, "cache creation input token", 5000, usage.AnthropicCacheCreationInputToken)
+	// map key preserved verbatim so ai-statistics log output (input_token_details) is unaffected.
+	assertInt64(t, "cache_write_tokens detail preserved", 5000, usage.InputTokenDetails[InputTokenDetailsKeyOpenAICacheWriteTokens])
+	assertInt64(t, "cached token detail", 59136, usage.InputTokenDetails["cached_tokens"])
+	assertInt64(t, "total token", 72733, usage.TotalToken)
+}
+
+func TestGetTokenUsageOpenAIResponsesZeroCacheWriteLeavesCacheCreationEmpty(t *testing.T) {
+	ctx := newTestHttpContext()
+	// The documented GPT-5.6 sample where cache_write_tokens is 0.
+	body := []byte(`{
+		"response": {
+			"id": "resp_test",
+			"model": "gpt-5.6-sol",
+			"usage": {
+				"input_tokens": 71092,
+				"output_tokens": 1641,
+				"total_tokens": 72733,
+				"input_tokens_details": {
+					"cached_tokens": 59136,
+					"cache_write_tokens": 0
+				}
+			}
+		}
+	}`)
+
+	usage := GetTokenUsage(ctx, body)
+
+	assertInt64(t, "input token", 11956, usage.InputToken)
+	assertInt64(t, "cache creation input token", 0, usage.AnthropicCacheCreationInputToken)
+	assertInt64(t, "cache_write_tokens detail preserved", 0, usage.InputTokenDetails[InputTokenDetailsKeyOpenAICacheWriteTokens])
+	assertInt64(t, "total token", 72733, usage.TotalToken)
+}
+
 func assertInt64(t *testing.T, name string, want, got int64) {
 	t.Helper()
 	if got != want {

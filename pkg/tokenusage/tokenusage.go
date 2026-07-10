@@ -85,6 +85,7 @@ const (
 	InputTokenDetailsKeyAnthropicMessagesUsageCacheCreationInputTokens = "cache_creation_input_tokens"
 	InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens     = "cache_read_input_tokens"
 	InputTokenDetailsKeyCachedTokens                                   = "cached_tokens"
+	InputTokenDetailsKeyOpenAICacheWriteTokens                         = "cache_write_tokens"
 	InputTokenDetailsKeyGeminiCachedContentTokenCount                  = "cached_content_token_count"
 	InputTokenDetailsKeyGeminiToolUsePromptTokenCount                  = "tool_use_prompt_token_count"
 
@@ -258,6 +259,13 @@ func ExtractInputTokenDetails(ctx wrapper.HttpContext, body []byte, u *TokenUsag
 	}); cacheReadInputToken != nil {
 		u.AnthropicCacheReadInputToken = cacheReadInputToken.Int()
 		u.InputTokenDetails[InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens] = cacheReadInputToken.Int()
+	}
+
+	// OpenAI GPT-5.6: cache_write_tokens 与 input_token 平级、独立计费,归入 cache-creation 桶
+	// (与 Anthropic cache_creation_input_tokens 同口径;两家模型名不重叠,合桶不冲突)。
+	// 注意:不改动 InputTokenDetails map,cache_write_tokens 键原样保留,日志输出不受影响。
+	if cacheWriteToken, ok := u.InputTokenDetails[InputTokenDetailsKeyOpenAICacheWriteTokens]; ok {
+		u.AnthropicCacheCreationInputToken += cacheWriteToken
 	}
 	ctx.SetUserAttribute(CtxKeyInputTokenDetails, u.InputTokenDetails)
 }

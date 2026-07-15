@@ -62,6 +62,9 @@ const (
 	UsageCachedInputTokensPathOpenAIChatCompletions = "usage.prompt_tokens_details.cached_tokens"
 	UsageCachedInputTokensPathOpenAIResponses       = "response.usage.input_tokens_details.cached_tokens"
 
+	UsageCacheWriteTokensPathOpenAIChatCompletions = "usage.prompt_tokens_details.cache_write_tokens"
+	UsageCacheWriteTokensPathOpenAIResponses       = "response.usage.input_tokens_details.cache_write_tokens"
+
 	UsageOutputTokensPathOpenAIChatCompletions = "usage.completion_tokens"
 	UsageOutputTokensPathOpenAIImages          = "usage.output_tokens"
 	UsageOutputTokensPathOpenAIResponses       = "response.usage.output_tokens"
@@ -104,6 +107,11 @@ type TokenUsage struct {
 	TotalToken         int64
 	Model              string
 	CachedInputToken   int64
+
+	// OpenAI GPT-5.6 cache write (cache_write_tokens). Kept separate from the
+	// Anthropic cache-creation field; consumers sum the two like they do for
+	// cache-read (CachedInputToken + AnthropicCacheReadInputToken).
+	OpenAICacheWriteInputToken int64
 
 	// Anthropic Messages
 	AnthropicCacheCreationInputToken int64
@@ -192,9 +200,19 @@ func ExtractInputTokens(ctx wrapper.HttpContext, body []byte, u *TokenUsage) {
 		}); cachedInputToken != nil {
 			u.CachedInputToken = cachedInputToken.Int()
 			u.InputToken -= u.CachedInputToken
-			if u.InputToken < 0 {
-				u.InputToken = 0
-			}
+		}
+		// OpenAI GPT-5.6: cache_write_tokens 是(已剔除 cached 后的)input 的子集——本次新鲜输入
+		// 中被写入缓存的部分,按缓存写入价单独计费。与 cached 同样从 input 剔除,避免这批 token 被
+		// input 与 cache_write 双重计费。实测:input(含 cached)321411,cached 6912,cache_write 314499
+		// → 纯普通输入 = 321411-6912-314499 = 0。归入 cache-creation 桶的动作在 ExtractInputTokenDetails。
+		if cacheWriteToken := wrapper.GetValueFromBody(body, []string{
+			UsageCacheWriteTokensPathOpenAIChatCompletions,
+			UsageCacheWriteTokensPathOpenAIResponses,
+		}); cacheWriteToken != nil {
+			u.InputToken -= cacheWriteToken.Int()
+		}
+		if u.InputToken < 0 {
+			u.InputToken = 0
 		}
 	} else {
 		inputToken, ok := ctx.GetUserAttribute(CtxKeyInputToken).(int64) // anthropic messages
@@ -261,11 +279,12 @@ func ExtractInputTokenDetails(ctx wrapper.HttpContext, body []byte, u *TokenUsag
 		u.InputTokenDetails[InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens] = cacheReadInputToken.Int()
 	}
 
-	// OpenAI GPT-5.6: cache_write_tokens 与 input_token 平级、独立计费,归入 cache-creation 桶
-	// (与 Anthropic cache_creation_input_tokens 同口径;两家模型名不重叠,合桶不冲突)。
+	// OpenAI GPT-5.6: cache_write_tokens 记入独立字段,与 Anthropic cache-creation 保持分离
+	// (风格对齐 cache-read:OpenAI CachedInputToken 与 Anthropic AnthropicCacheReadInputToken 分开存,
+	// 由 ai-quota / ai-statistics 消费侧相加)。从 input_token 剔除这批 token 的动作在 ExtractInputTokens。
 	// 注意:不改动 InputTokenDetails map,cache_write_tokens 键原样保留,日志输出不受影响。
 	if cacheWriteToken, ok := u.InputTokenDetails[InputTokenDetailsKeyOpenAICacheWriteTokens]; ok {
-		u.AnthropicCacheCreationInputToken += cacheWriteToken
+		u.OpenAICacheWriteInputToken = cacheWriteToken
 	}
 	ctx.SetUserAttribute(CtxKeyInputTokenDetails, u.InputTokenDetails)
 }
@@ -304,7 +323,7 @@ func ExtractTotalTokens(ctx wrapper.HttpContext, body []byte, u *TokenUsage) {
 	}); totalToken != nil {
 		u.TotalToken = totalToken.Int()
 	} else {
-		u.TotalToken = u.InputToken + u.OutputToken + u.CachedInputToken + u.AnthropicCacheCreationInputToken + u.AnthropicCacheReadInputToken
+		u.TotalToken = u.InputToken + u.OutputToken + u.CachedInputToken + u.OpenAICacheWriteInputToken + u.AnthropicCacheCreationInputToken + u.AnthropicCacheReadInputToken
 	}
 	ctx.SetUserAttribute(CtxKeyTotalToken, u.TotalToken)
 }

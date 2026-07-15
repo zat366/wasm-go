@@ -197,6 +197,29 @@ func TestExtractInputTokensOpenAIUsesNonCachedInputTokens(t *testing.T) {
 	assertInt64(t, "input token attribute", 20, ctx.GetUserAttribute(CtxKeyInputToken).(int64))
 }
 
+// ExtractInputTokens is self-contained: it subtracts both cached and cache_write
+// from input in one place, without depending on ExtractInputTokenDetails running first.
+func TestExtractInputTokensOpenAISubtractsCacheWrite(t *testing.T) {
+	ctx := newTestHttpContext()
+	body := []byte(`{
+		"usage": {
+			"prompt_tokens": 100,
+			"prompt_tokens_details": {
+				"cached_tokens": 80,
+				"cache_write_tokens": 15
+			}
+		}
+	}`)
+	usage := TokenUsage{}
+
+	ExtractInputTokens(ctx, body, &usage)
+
+	// 100 - cached(80) - cache_write(15) = 5 pure ordinary input.
+	assertInt64(t, "input token", 5, usage.InputToken)
+	assertInt64(t, "cached input token", 80, usage.CachedInputToken)
+	assertInt64(t, "input token attribute", 5, ctx.GetUserAttribute(CtxKeyInputToken).(int64))
+}
+
 func TestGetTokenUsageOpenAIWithoutProviderTotalKeepsCachedTokensInTotal(t *testing.T) {
 	ctx := newTestHttpContext()
 	body := []byte(`{
@@ -219,9 +242,9 @@ func TestGetTokenUsageOpenAIWithoutProviderTotalKeepsCachedTokensInTotal(t *test
 
 func TestGetTokenUsageOpenAIResponsesCacheWriteFoldsIntoCacheCreationBucket(t *testing.T) {
 	ctx := newTestHttpContext()
-	// GPT-5.6 responses sample: cache_write_tokens is parallel to input_token
-	// and billed separately; it must fold into the cache-creation bucket without
-	// being subtracted from input_token.
+	// GPT-5.6 responses sample: cache_write_tokens is a subset of the (post-cached)
+	// input_token — the fresh input written to cache. It folds into the cache-creation
+	// bucket AND is subtracted from input_token to avoid double counting.
 	body := []byte(`{
 		"response": {
 			"id": "resp_test",
@@ -240,15 +263,48 @@ func TestGetTokenUsageOpenAIResponsesCacheWriteFoldsIntoCacheCreationBucket(t *t
 
 	usage := GetTokenUsage(ctx, body)
 
-	// input_token = 71092 - cached(59136) = 11956, cache_write is NOT subtracted.
-	assertInt64(t, "input token", 11956, usage.InputToken)
+	// input_token = 71092 - cached(59136) = 11956, then - cache_write(5000) = 6956.
+	assertInt64(t, "input token", 6956, usage.InputToken)
 	assertInt64(t, "cached input token", 59136, usage.CachedInputToken)
 	// cache_write folded into the cache-creation bucket used by ai-quota billing / ai-statistics metrics.
-	assertInt64(t, "cache creation input token", 5000, usage.AnthropicCacheCreationInputToken)
+	assertInt64(t, "openai cache write input token", 5000, usage.OpenAICacheWriteInputToken)
 	// map key preserved verbatim so ai-statistics log output (input_token_details) is unaffected.
 	assertInt64(t, "cache_write_tokens detail preserved", 5000, usage.InputTokenDetails[InputTokenDetailsKeyOpenAICacheWriteTokens])
 	assertInt64(t, "cached token detail", 59136, usage.InputTokenDetails["cached_tokens"])
 	assertInt64(t, "total token", 72733, usage.TotalToken)
+	// input_token attribute reflects the post-subtraction value for downstream consumers.
+	assertInt64(t, "input token attribute", 6956, ctx.GetUserAttribute(CtxKeyInputToken).(int64))
+}
+
+func TestGetTokenUsageOpenAIResponsesCacheWriteEqualsAllFreshInput(t *testing.T) {
+	ctx := newTestHttpContext()
+	// Real production log (gpt-5.6-sol): all fresh input was written to cache, so
+	// cache_write_tokens(314499) == input_token(314499). After subtraction input goes
+	// to 0 and the whole fresh-input batch is billed at the cache-write rate.
+	body := []byte(`{
+		"response": {
+			"id": "resp_test",
+			"model": "gpt-5.6-sol",
+			"usage": {
+				"input_tokens": 314499,
+				"output_tokens": 1259,
+				"total_tokens": 322670,
+				"input_tokens_details": {
+					"cached_tokens": 6912,
+					"cache_write_tokens": 314499
+				}
+			}
+		}
+	}`)
+
+	usage := GetTokenUsage(ctx, body)
+
+	// input_token = 314499 - cached(6912) = 307587, then - cache_write(314499) clamps to 0.
+	assertInt64(t, "input token", 0, usage.InputToken)
+	assertInt64(t, "cached input token", 6912, usage.CachedInputToken)
+	assertInt64(t, "openai cache write input token", 314499, usage.OpenAICacheWriteInputToken)
+	assertInt64(t, "cache_write_tokens detail preserved", 314499, usage.InputTokenDetails[InputTokenDetailsKeyOpenAICacheWriteTokens])
+	assertInt64(t, "total token", 322670, usage.TotalToken)
 }
 
 func TestGetTokenUsageOpenAIResponsesZeroCacheWriteLeavesCacheCreationEmpty(t *testing.T) {
@@ -273,7 +329,7 @@ func TestGetTokenUsageOpenAIResponsesZeroCacheWriteLeavesCacheCreationEmpty(t *t
 	usage := GetTokenUsage(ctx, body)
 
 	assertInt64(t, "input token", 11956, usage.InputToken)
-	assertInt64(t, "cache creation input token", 0, usage.AnthropicCacheCreationInputToken)
+	assertInt64(t, "openai cache write input token", 0, usage.OpenAICacheWriteInputToken)
 	assertInt64(t, "cache_write_tokens detail preserved", 0, usage.InputTokenDetails[InputTokenDetailsKeyOpenAICacheWriteTokens])
 	assertInt64(t, "total token", 72733, usage.TotalToken)
 }

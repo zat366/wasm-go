@@ -384,8 +384,7 @@ func TestGetTokenUsageBailianImplicitCacheKeepsCachedTokens(t *testing.T) {
 	assertInt64(t, "cache read bucket", 2048, usage.CacheReadInputToken)
 	assertInt64(t, "cache write bucket", 0, usage.CacheWriteInputToken)
 	assertInt64(t, "cached input token", 2048, usage.CachedInputToken)
-	// No explicit-cache fields set.
-	assertInt64(t, "bailian cache read", 0, usage.BailianCacheReadInputToken)
+	// No explicit-cache field set.
 	assertInt64(t, "bailian cache creation", 0, usage.BailianCacheCreationInputToken)
 	// cached_tokens key preserved (implicit 20% tier); no cache_read_input_tokens key added.
 	assertInt64(t, "cached_tokens detail preserved", 2048, usage.InputTokenDetails[InputTokenDetailsKeyCachedTokens])
@@ -396,10 +395,11 @@ func TestGetTokenUsageBailianImplicitCacheKeepsCachedTokens(t *testing.T) {
 }
 
 // Bailian EXPLICIT cache (OpenAI-compat): cache_creation_input_tokens sits alongside cached_tokens in
-// prompt_tokens_details. The hit bills at 10% (explicit-read) and the creation at 125%, so the hit is
-// re-keyed from cached_tokens to cache_read_input_tokens (into the cache-read bucket) and the creation
-// folds into the cache-write bucket. Both are inclusive, so both are netted out of InputToken.
-func TestGetTokenUsageBailianExplicitCacheReKeysHitAndCapturesCreation(t *testing.T) {
+// prompt_tokens_details. The hit is NOT re-keyed or split out — it stays in CachedInputToken/
+// cached_tokens like any other OpenAI-family cache-read (explicit vs implicit billing is a consumer
+// concern, since only the consumer knows whether the request carried cache_control). The creation
+// tokens (no OpenAI counterpart) get their own bucket. Both are inclusive, so both are netted out.
+func TestGetTokenUsageBailianExplicitCacheKeepsCachedTokensAndCapturesCreation(t *testing.T) {
 	ctx := newTestHttpContext()
 	// Mirrors the doc's explicit-cache 2nd request: a 1605 hit plus a freshly created block, ~15 uncached.
 	body := []byte(`{
@@ -422,15 +422,13 @@ func TestGetTokenUsageBailianExplicitCacheReKeysHitAndCapturesCreation(t *testin
 	assertInt64(t, "net input token", 15, usage.InputToken)
 	assertInt64(t, "cache read bucket", 1605, usage.CacheReadInputToken)
 	assertInt64(t, "cache write bucket", 300, usage.CacheWriteInputToken)
-	assertInt64(t, "bailian cache read", 1605, usage.BailianCacheReadInputToken)
+	assertInt64(t, "cached input token", 1605, usage.CachedInputToken)
 	assertInt64(t, "bailian cache creation", 300, usage.BailianCacheCreationInputToken)
-	// Implicit field must stay empty so the two tiers are not double-counted.
-	assertInt64(t, "cached input token", 0, usage.CachedInputToken)
-	// Hit re-keyed to cache_read_input_tokens; original cached_tokens key removed.
-	assertInt64(t, "cache_read_input_tokens detail", 1605, usage.InputTokenDetails[InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens])
+	// cached_tokens key preserved verbatim; not re-keyed to cache_read_input_tokens.
+	assertInt64(t, "cached_tokens detail preserved", 1605, usage.InputTokenDetails[InputTokenDetailsKeyCachedTokens])
 	assertInt64(t, "cache_creation_input_tokens detail", 300, usage.InputTokenDetails[InputTokenDetailsKeyAnthropicMessagesUsageCacheCreationInputTokens])
-	if _, ok := usage.InputTokenDetails[InputTokenDetailsKeyCachedTokens]; ok {
-		t.Fatalf("explicit cache must re-key cached_tokens to cache_read_input_tokens")
+	if _, ok := usage.InputTokenDetails[InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens]; ok {
+		t.Fatalf("explicit cache must not synthesize a cache_read_input_tokens detail key")
 	}
 	assertInt64(t, "total token", 1970, usage.TotalToken)
 }
@@ -541,6 +539,10 @@ func TestGetTokenUsageAnthropicCacheNotNetted(t *testing.T) {
 	assertInt64(t, "cache write bucket", 20, usage.CacheWriteInputToken)
 	assertInt64(t, "anthropic cache read", 50, usage.AnthropicCacheReadInputToken)
 	assertInt64(t, "anthropic cache creation", 20, usage.AnthropicCacheCreationInputToken)
+	// No cached_tokens key present (this is top-level Anthropic usage, not prompt_tokens_details), so
+	// the Bailian explicit-cache branch must not also claim this cache_creation_input_tokens value —
+	// otherwise it would double-count into the cache write bucket (would read 40 instead of 20 above).
+	assertInt64(t, "bailian cache creation must stay empty for plain anthropic", 0, usage.BailianCacheCreationInputToken)
 	// fallback total (no provider total_tokens): raw input 100 + output 40 + anthropic 50 + 20 = 210.
 	assertInt64(t, "total token", 210, usage.TotalToken)
 }

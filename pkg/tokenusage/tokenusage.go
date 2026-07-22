@@ -113,7 +113,8 @@ type TokenUsage struct {
 	Model              string
 
 	// CacheReadInputToken is the unified cache-read bucket across all providers: OpenAI cached_tokens
-	// + Bailian explicit cache-read + Anthropic cache_read + Gemini cached_content + DeepSeek prompt_cache_hit.
+	// (also covers Bailian explicit/implicit cache-read, both reported via cached_tokens) + Anthropic
+	// cache_read + Gemini cached_content + DeepSeek prompt_cache_hit.
 	CacheReadInputToken int64
 	// CacheWriteInputToken is the unified cache-write bucket:
 	// OpenAI cache_write_tokens + Bailian explicit cache-creation + Anthropic cache_creation.
@@ -137,16 +138,12 @@ type TokenUsage struct {
 	// Folded into CacheReadInputToken.
 	GeminiCachedContentToken int64
 
-	// Bailian (阿里云百炼) OpenAI/DashScope-compatible EXPLICIT cache. Explicit and implicit cache
-	// both report the hit in prompt_tokens_details.cached_tokens, but bill differently (explicit
-	// hit 10% vs implicit 20%), so they must land in different buckets. Explicit cache is detected
-	// by the presence of cache_creation_input_tokens in prompt_tokens_details; when present, the
-	// hit is moved out of CachedInputToken into BailianCacheReadInputToken (re-keyed to
-	// cache_read_input_tokens in the details map) and the creation tokens are captured here.
-	// Both are inclusive (part of prompt_tokens) — like the other OpenAI-family cache and unlike
-	// Anthropic's — so both are netted out of InputToken. BailianCacheReadInputToken folds into
-	// CacheReadInputToken; BailianCacheCreationInputToken (125% create) folds into CacheWriteInputToken.
-	BailianCacheReadInputToken     int64
+	// BailianCacheCreationInputToken is Bailian (阿里云百炼) OpenAI/DashScope-compat EXPLICIT
+	// cache-creation (prompt_tokens_details.cache_creation_input_tokens, 125% rate). The cache-read
+	// hit that may accompany it lands in cached_tokens/CachedInputToken like any other OpenAI-family
+	// cache-read — explicit vs implicit billing tiers are not distinguished here; that is left to the
+	// consumer (it needs the request's cache_control, which this response-only extractor never sees).
+	// Inclusive (part of prompt_tokens), so netted out of InputToken; folds into CacheWriteInputToken.
 	BailianCacheCreationInputToken int64
 
 	// Anthropic Messages (exclusive family: not part of the provider's input_tokens).
@@ -159,13 +156,12 @@ type TokenUsage struct {
 // becomes the net pure-text input. Idempotency across the streaming chunk loop is guaranteed by
 // deriving InputToken from the raw prompt tokens on every chunk before this runs once at the end.
 //
-// Inclusive family (OpenAI cached_tokens/cache_write_tokens, Bailian explicit cache-read/creation,
+// Inclusive family (OpenAI cached_tokens/cache_write_tokens, Bailian explicit cache-creation,
 // Gemini cached_content, DeepSeek hit) lives inside the provider's prompt tokens and is subtracted.
 // Anthropic cache is exclusive — the provider's input_tokens never included it — so it is NOT
 // subtracted, avoiding an under-count.
 func (u *TokenUsage) normalizeCacheBuckets() {
 	u.CacheReadInputToken = u.CachedInputToken +
-		u.BailianCacheReadInputToken +
 		u.AnthropicCacheReadInputToken +
 		u.GeminiCachedContentToken +
 		u.DeepSeekPromptCacheHitToken
@@ -175,7 +171,6 @@ func (u *TokenUsage) normalizeCacheBuckets() {
 
 	inclusiveCache := u.CachedInputToken +
 		u.OpenAICacheWriteInputToken +
-		u.BailianCacheReadInputToken +
 		u.BailianCacheCreationInputToken +
 		u.GeminiCachedContentToken +
 		u.DeepSeekPromptCacheHitToken
@@ -336,32 +331,34 @@ func ExtractInputTokenDetails(ctx wrapper.HttpContext, body []byte, u *TokenUsag
 		u.InputTokenDetails[InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens] = cacheReadInputToken.Int()
 	}
 
-	// OpenAI-family cache-read lives in prompt_tokens_details.cached_tokens (inclusive; netted out
-	// of InputToken in normalizeCacheBuckets). Bailian (阿里云百炼) OpenAI/DashScope-compat splits
-	// this into two billing tiers that share the cached_tokens field:
-	//   - 隐式缓存 (implicit): only cached_tokens present  → 20% rate, keep as CachedInputToken/cached_tokens.
-	//   - 显式缓存 (explicit): cache_creation_input_tokens sits alongside cached_tokens in the details →
-	//     hit bills at 10% and creation at 125%. Re-key the hit to cache_read_input_tokens so the
-	//     consumer bills it at the explicit-read rate (parallel to Anthropic cache_read), and capture
-	//     the creation tokens for the cache-write (125%) bucket. Both are inclusive → both netted out.
-	// The cached_tokens guard ensures this is OpenAI-shaped: Anthropic never emits cached_tokens, so
-	// its top-level cache_creation_input_tokens (already handled above) cannot trigger this branch.
-	// Each branch is fully deterministic (sets one tier, zeroes the other) so a streaming response
-	// whose early chunk looks implicit and whose final usage chunk is explicit does not leave a
-	// stale CachedInputToken behind to double-count.
+	// OpenAI-family cache-read lives in prompt_tokens_details.cached_tokens (inclusive; netted out of
+	// InputToken in normalizeCacheBuckets). Bailian (阿里云百炼) OpenAI/DashScope-compat reports both its
+	// explicit and implicit cache-read hits through this same cached_tokens field — they bill at
+	// different rates (explicit 10% vs implicit 20%), but that distinction requires knowing whether the
+	// request carried a cache_control marker, which this response-only extractor never sees. So the hit
+	// is not re-keyed or split here; it is kept as CachedInputToken/cached_tokens like any other OpenAI
+	// cache-read, and the explicit/implicit billing split is left entirely to the consumer.
 	cachedToken, hasCached := u.InputTokenDetails[InputTokenDetailsKeyCachedTokens]
+	if hasCached {
+		u.CachedInputToken = cachedToken
+	}
+
+	// cache_creation_input_tokens is ambiguous on its own: Bailian's explicit tier reports it inside
+	// prompt_tokens_details alongside cached_tokens, but the same map key is also populated above
+	// (line ~330) from Anthropic's top-level usage.cache_creation_input_tokens — a completely
+	// different field, already captured in AnthropicCacheCreationInputToken. Gating on hasCached is
+	// what tells these two sources apart: only prompt_tokens_details ever has BOTH cached_tokens and
+	// cache_creation_input_tokens together, so hasCached && hasCacheCreation is required to route the
+	// value into BailianCacheCreationInputToken. Without that gate, a plain Anthropic Messages response
+	// (cache_read/cache_creation only, no cached_tokens) would double-count its cache_creation into
+	// both AnthropicCacheCreationInputToken and BailianCacheCreationInputToken.
 	cacheCreationToken, hasCacheCreation := u.InputTokenDetails[InputTokenDetailsKeyAnthropicMessagesUsageCacheCreationInputTokens]
 	if hasCached && hasCacheCreation {
-		// Bailian 显式缓存.
-		u.CachedInputToken = 0
-		u.BailianCacheReadInputToken = cachedToken
 		u.BailianCacheCreationInputToken = cacheCreationToken
-		u.InputTokenDetails[InputTokenDetailsKeyAnthropicMessagesUsageCacheReadInputTokens] = cachedToken
-		delete(u.InputTokenDetails, InputTokenDetailsKeyCachedTokens)
-	} else if hasCached {
-		// 隐式缓存 / generic OpenAI cache-read.
-		u.CachedInputToken = cachedToken
-		u.BailianCacheReadInputToken = 0
+	} else {
+		// Cleared (not just left at zero-value) so a streaming response whose earlier chunk was
+		// Bailian-explicit-shaped and whose final usage chunk drops the cached_tokens/cache_creation
+		// pairing doesn't leave a stale creation count behind to double-count in normalizeCacheBuckets.
 		u.BailianCacheCreationInputToken = 0
 	}
 

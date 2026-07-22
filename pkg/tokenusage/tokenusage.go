@@ -97,6 +97,11 @@ const (
 
 	ctxKeyDeltaSSEMessage = "delta_sse_message"
 	ctxKeyDeltaBeginning  = "delta_beginning"
+	// ctxKeyRawInputToken holds the RAW (pre-net) provider input across chunks/callbacks. It is kept
+	// separate from CtxKeyInputToken (which GetTokenUsage overwrites with the NET value post-loop) so
+	// the cross-chunk fallback always re-nets from raw and never compounds. Stored via SetContext, not
+	// a user attribute, so it stays internal and does not surface in the request log.
+	ctxKeyRawInputToken = "raw_input_token"
 )
 
 type TokenUsage struct {
@@ -186,6 +191,14 @@ func GetTokenUsage(ctx wrapper.HttpContext, body []byte) TokenUsage {
 		InputTokenDetails:  make(map[string]int64),
 		OutputTokenDetails: make(map[string]int64),
 	}
+	// sawUsage guards against zero-clobbering the published token attributes on a call whose body
+	// carries no usage data at all. A streaming response interleaves usage-bearing chunks (OpenAI
+	// final chunk, Anthropic message_start/message_delta, Gemini usageMetadata) with usage-less frames
+	// (ping, content_block_start/stop, [DONE]). Those usage-less frames skip the loop body entirely,
+	// leaving u at its zero value; without this guard the post-loop republish would overwrite an
+	// already-established input_token with 0 whenever such a frame is the last one through
+	// GetTokenUsage — the observed Anthropic-streaming "input_token: 0, total_token: 32" log.
+	sawUsage := false
 	for chunk := range chunks {
 		// the feature strings are used to identify the usage data, like:
 		// {"model":"gpt2","usage":{"prompt_tokens":1,"completion_tokens":1}}
@@ -196,6 +209,7 @@ func GetTokenUsage(ctx wrapper.HttpContext, body []byte) TokenUsage {
 		if !bytes.Contains(chunk, []byte(`"usage"`)) && !bytes.Contains(chunk, []byte(`"usageMetadata"`)) {
 			continue
 		}
+		sawUsage = true
 
 		ExtractModel(ctx, chunk, &u)
 		ExtractInputTokens(ctx, chunk, &u)
@@ -203,6 +217,11 @@ func GetTokenUsage(ctx wrapper.HttpContext, body []byte) TokenUsage {
 		ExtractInputTokenDetails(ctx, chunk, &u)
 		ExtractOutputTokenDetails(ctx, chunk, &u)
 		ExtractTotalTokens(ctx, chunk, &u)
+	}
+	// A call with no usage-bearing chunk is a no-op: return the zero-value struct without touching any
+	// published attribute, so the values established by an earlier usage-bearing call survive intact.
+	if !sawUsage {
+		return u
 	}
 	// Aggregate cache buckets and net the inclusive-family cache out of InputToken. Done once here,
 	// after the chunk loop, because ExtractInputTokens re-reads the raw prompt tokens per chunk and
@@ -263,14 +282,17 @@ func ExtractInputTokens(ctx wrapper.HttpContext, body []byte, u *TokenUsage) {
 		UsageInputTokensPathAnthropicMessages,     // Anthrophic messages
 	}); inputToken != nil {
 		u.InputToken = inputToken.Int()
-	} else {
-		inputToken, ok := ctx.GetUserAttribute(CtxKeyInputToken).(int64) // anthropic messages
-		if ok && inputToken > 0 {
-			u.InputToken = inputToken
-		}
+	} else if rawInputToken, ok := ctx.GetContext(ctxKeyRawInputToken).(int64); ok && rawInputToken > 0 {
+		// Cross-chunk/callback fallback (e.g. anthropic messages): read the RAW input carried on the
+		// internal context key, NOT CtxKeyInputToken — the latter is overwritten with the NET value at
+		// the end of each GetTokenUsage call, so reading it back would re-net an already-netted value
+		// and compound the subtraction down toward zero across repeated calls.
+		u.InputToken = rawInputToken
 	}
-	// Within a single GetTokenUsage call the attribute stays raw (netting runs once, post-loop).
-	// GetTokenUsage republishes the NET value on this attribute at the end for consumers.
+	// Persist the RAW input on the internal context key for the fallback above; netting runs once,
+	// post-loop, and never writes back here. GetTokenUsage republishes the NET value on the public
+	// CtxKeyInputToken attribute at the end for consumers (ai-statistics etc.).
+	ctx.SetContext(ctxKeyRawInputToken, u.InputToken)
 	ctx.SetUserAttribute(CtxKeyInputToken, u.InputToken)
 }
 

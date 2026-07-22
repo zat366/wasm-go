@@ -547,6 +547,105 @@ func TestGetTokenUsageAnthropicCacheNotNetted(t *testing.T) {
 	assertInt64(t, "total token", 210, usage.TotalToken)
 }
 
+// Regression for the production log where input_token collapsed to 0 while cached_tokens(9600) and
+// total_tokens(50660) stayed intact. A streaming response drives GetTokenUsage over the same ctx
+// repeatedly; the FIRST call sees the full usage, but LATER summary chunks carry usage/total without
+// re-stating input_tokens, forcing the fallback. Netting must re-derive from the raw input every
+// time, never re-subtract the cache off an already-netted value and drift toward zero.
+func TestGetTokenUsageRepeatedCallsDoNotCompoundNetting(t *testing.T) {
+	ctx := newTestHttpContext()
+	full := []byte(`{
+		"response": {
+			"id": "resp_test",
+			"model": "gpt-5.5",
+			"usage": {
+				"input_tokens": 50648,
+				"output_tokens": 12,
+				"total_tokens": 50660,
+				"input_tokens_details": {
+					"cached_tokens": 9600
+				}
+			}
+		}
+	}`)
+	// Later streaming call: usage present (so it is not skipped) and total restated, but no input_tokens
+	// — the shape that forced the buggy fallback to re-net the already-net value.
+	summaryNoInput := []byte(`{
+		"response": {
+			"id": "resp_test",
+			"model": "gpt-5.5",
+			"usage": {
+				"output_tokens": 12,
+				"total_tokens": 50660,
+				"input_tokens_details": {
+					"cached_tokens": 9600
+				}
+			}
+		}
+	}`)
+
+	// First pass: net input = 50648 - 9600 = 41048.
+	first := GetTokenUsage(ctx, full)
+	assertInt64(t, "net input (1st call)", 41048, first.InputToken)
+	assertInt64(t, "cache read (1st call)", 9600, first.CacheReadInputToken)
+	assertInt64(t, "total (1st call)", 50660, first.TotalToken)
+
+	// Subsequent summary chunks must hold at 41048. Buggy code re-nets each time (41048-9600=31448,
+	// then 21848, …), drifting toward the clamped 0 seen in the log. Loop several times to prove the
+	// value is stable, not merely "not yet zero".
+	for i := 2; i <= 4; i++ {
+		u := GetTokenUsage(ctx, summaryNoInput)
+		assertInt64(t, "net input (repeat call, no compounding)", 41048, u.InputToken)
+		assertInt64(t, "cache read (repeat call)", 9600, u.CacheReadInputToken)
+		assertInt64(t, "total (repeat call)", 50660, u.TotalToken)
+	}
+
+	// The public attribute consumers read must also be the stable net value.
+	assertInt64(t, "net input attribute", 41048, ctx.GetUserAttribute(CtxKeyInputToken).(int64))
+}
+
+// Regression companion: the cross-chunk fallback (later chunk lacks input_tokens, e.g. anthropic-style
+// deltas) must resolve to the RAW input carried on the internal context key, not the net value on
+// CtxKeyInputToken — otherwise the fallback path re-nets an already-netted number.
+func TestGetTokenUsageFallbackUsesRawNotNettedInput(t *testing.T) {
+	ctx := newTestHttpContext()
+	full := []byte(`{
+		"response": {
+			"id": "resp_test",
+			"model": "gpt-5.5",
+			"usage": {
+				"input_tokens": 1000,
+				"output_tokens": 10,
+				"total_tokens": 1010,
+				"input_tokens_details": {
+					"cached_tokens": 600
+				}
+			}
+		}
+	}`)
+	// A follow-up chunk that carries usage/output but no input_tokens, forcing the fallback branch.
+	noInput := []byte(`{
+		"response": {
+			"id": "resp_test",
+			"model": "gpt-5.5",
+			"usage": {
+				"output_tokens": 10,
+				"input_tokens_details": {
+					"cached_tokens": 600
+				}
+			}
+		}
+	}`)
+
+	first := GetTokenUsage(ctx, full)
+	assertInt64(t, "net input (full chunk)", 400, first.InputToken)
+
+	// Fallback must recover raw 1000 → net 400, not net-of-net (400-600 clamped to 0).
+	second := GetTokenUsage(ctx, noInput)
+	assertInt64(t, "net input via raw fallback", 400, second.InputToken)
+	assertInt64(t, "cache read via raw fallback", 600, second.CacheReadInputToken)
+}
+
 func assertInt64(t *testing.T, name string, want, got int64) {
 	t.Helper()
 	if got != want {

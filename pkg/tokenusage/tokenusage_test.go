@@ -646,6 +646,48 @@ func TestGetTokenUsageFallbackUsesRawNotNettedInput(t *testing.T) {
 	assertInt64(t, "cache read via raw fallback", 600, second.CacheReadInputToken)
 }
 
+// Regression for the reported Anthropic-streaming log where input_token was 0 while total_token was
+// 32. ai-statistics calls GetTokenUsage ONCE PER streaming chunk over the same ctx. Anthropic splits
+// usage across events: message_start carries message.usage.input_tokens (output is a placeholder),
+// message_delta carries only the final top-level usage.output_tokens with NO input_tokens. The input
+// established by message_start must survive to the message_delta call via the cross-chunk fallback.
+func TestGetTokenUsageAnthropicStreamingPerChunkCarriesInput(t *testing.T) {
+	ctx := newTestHttpContext()
+
+	// message_start: input_tokens=15, output placeholder=1.
+	messageStart := []byte(`data: {"type":"message_start","message":{"id":"msg_1","model":"claude-3-sonnet-20240229","usage":{"input_tokens":15,"output_tokens":1}}}` + "\n\n")
+	start := GetTokenUsage(ctx, messageStart)
+	assertInt64(t, "input after message_start", 15, start.InputToken)
+
+	// message_delta: final output only, no input_tokens. Fallback must carry input=15 across the call.
+	messageDelta := []byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":17}}` + "\n\n")
+	final := GetTokenUsage(ctx, messageDelta)
+	assertInt64(t, "input carried into message_delta", 15, final.InputToken)
+	assertInt64(t, "output at message_delta", 17, final.OutputToken)
+	// No provider total in Anthropic usage: fallback total = input(15) + output(17) = 32 (the log value).
+	assertInt64(t, "fallback total", 32, final.TotalToken)
+	assertInt64(t, "input attribute for consumers", 15, ctx.GetUserAttribute(CtxKeyInputToken).(int64))
+}
+
+// Regression for the exact clobber: after usage is established, a trailing usage-less frame
+// (content_block_stop / ping / [DONE]) is the LAST chunk through GetTokenUsage. Such a frame skips
+// the loop body, so without the no-usage guard the post-loop republish overwrote the input_token
+// attribute with 0 — producing the logged input_token:0 while total stayed intact. The guard makes a
+// usage-less call a no-op that leaves every previously published attribute untouched.
+func TestGetTokenUsageTrailingNonUsageChunkDoesNotClobberInput(t *testing.T) {
+	ctx := newTestHttpContext()
+
+	GetTokenUsage(ctx, []byte(`data: {"type":"message_start","message":{"id":"msg_1","model":"claude-3-sonnet-20240229","usage":{"input_tokens":15,"output_tokens":1}}}`+"\n\n"))
+	GetTokenUsage(ctx, []byte(`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":17}}`+"\n\n"))
+	assertInt64(t, "input before trailing frame", 15, ctx.GetUserAttribute(CtxKeyInputToken).(int64))
+
+	// Trailing frame with no "usage": must not touch the attribute. Returned struct is the zero value
+	// (this call parsed nothing), but the published attribute the final ai_log reads must stay 15.
+	trailing := GetTokenUsage(ctx, []byte(`data: {"type":"content_block_stop","index":0}`+"\n\n"))
+	assertInt64(t, "trailing call is a no-op on struct", 0, trailing.InputToken)
+	assertInt64(t, "input attribute NOT clobbered by trailing frame", 15, ctx.GetUserAttribute(CtxKeyInputToken).(int64))
+}
+
 func assertInt64(t *testing.T, name string, want, got int64) {
 	t.Helper()
 	if got != want {
